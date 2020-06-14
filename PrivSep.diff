@@ -1,0 +1,1896 @@
+diff --git a/nginx/auto/lib/openssl/make b/nginx/auto/lib/openssl/make
+index 126a2387..a6090c6d 100644
+--- a/nginx/auto/lib/openssl/make
++++ b/nginx/auto/lib/openssl/make
+@@ -51,7 +51,7 @@ END
+ $OPENSSL/.openssl/include/openssl/ssl.h:	$NGX_MAKEFILE
+ 	cd $OPENSSL \\
+ 	&& if [ -f Makefile ]; then \$(MAKE) clean; fi \\
+-	&& ./config --prefix=$ngx_prefix no-shared no-threads $OPENSSL_OPT \\
++	&& ./config --prefix=$ngx_prefix no-shared $OPENSSL_OPT \\
+ 	&& \$(MAKE) \\
+ 	&& \$(MAKE) install_sw LIBDIR=lib
+ 
+diff --git a/nginx/configure b/nginx/configure
+old mode 100644
+new mode 100755
+diff --git a/openssl-1.1.1/Configurations/shared-info.pl b/openssl-1.1.1/Configurations/shared-info.pl
+index 47eddd68..832886a7 100644
+--- a/openssl-1.1.1/Configurations/shared-info.pl
++++ b/openssl-1.1.1/Configurations/shared-info.pl
+@@ -25,7 +25,7 @@ sub detect_gnu_cc {
+ my %shared_info;
+ %shared_info = (
+     'gnu-shared' => {
+-        shared_ldflag         => '-shared -Wl,-Bsymbolic',
++        shared_ldflag         => '-shared -Wl,-Bsymbolic -lpthread',
+         shared_sonameflag     => '-Wl,-soname=',
+     },
+     'linux-shared' => sub {
+diff --git a/openssl-1.1.1/Configure b/openssl-1.1.1/Configure
+index d300a766..86de657a 100644
+--- a/openssl-1.1.1/Configure
++++ b/openssl-1.1.1/Configure
+@@ -311,7 +311,7 @@ $config{sdirs} = [
+     "bn", "ec", "rsa", "dsa", "dh", "sm2", "dso", "engine",
+     "buffer", "bio", "stack", "lhash", "rand", "err",
+     "evp", "asn1", "pem", "x509", "x509v3", "conf", "txt_db", "pkcs7", "pkcs12", "comp", "ocsp", "ui",
+-    "cms", "ts", "srp", "cmac", "ct", "async", "kdf", "store"
++    "cms", "ts", "srp", "cmac", "ct", "async", "kdf", "store", "rpc"
+     ];
+ # test/ subdirectories to build
+ $config{tdirs} = [ "ossl_shim" ];
+diff --git a/openssl-1.1.1/config b/openssl-1.1.1/config
+old mode 100644
+new mode 100755
+diff --git a/openssl-1.1.1/crypto/ex_data.c b/openssl-1.1.1/crypto/ex_data.c
+index 08dc7c40..a798f070 100644
+--- a/openssl-1.1.1/crypto/ex_data.c
++++ b/openssl-1.1.1/crypto/ex_data.c
+@@ -9,6 +9,7 @@
+ 
+ #include "internal/cryptlib_int.h"
+ #include "internal/thread_once.h"
++#include <crypto/rsa/rsa_locl.h>
+ 
+ /*
+  * Each structure type (sometimes called a class), that supports
+diff --git a/openssl-1.1.1/crypto/rpc/build.info b/openssl-1.1.1/crypto/rpc/build.info
+new file mode 100644
+index 00000000..45531ec0
+--- /dev/null
++++ b/openssl-1.1.1/crypto/rpc/build.info
+@@ -0,0 +1,3 @@
++LIBS=../../libcrypto ../../libssl
++SOURCE[../../libcrypto]=\
++        rpc.c
+diff --git a/openssl-1.1.1/crypto/rpc/rpc.c b/openssl-1.1.1/crypto/rpc/rpc.c
+new file mode 100644
+index 00000000..1031f481
+--- /dev/null
++++ b/openssl-1.1.1/crypto/rpc/rpc.c
+@@ -0,0 +1,552 @@
++#include "rpc.h"
++
++// We only need execinfo for backtraces
++#ifdef PRIV_SEP_DEBUG
++    #include <execinfo.h>
++#endif
++
++// We need stdio and stdlib for priv sep and for
++// opening / writing the file benchmark data.
++// Note that benchmark data can be taken for vanilla
++// with no priv sep enabled.
++#if defined(PRIV_SEP_FUNC_ENABLED) || defined(PRIV_SEP_BENCHMARK)
++    #include <stdio.h>
++    #include <stdlib.h>
++#endif
++
++#ifdef PRIV_SEP_FUNC_ENABLED
++#include <string.h>
++#include <crypto/rsa/rsa_locl.h>
++
++
++PrivSepConfigData *priv_sep_config;
++
++// Only need select for watching sockets when in
++// process-based priv sep mode.
++#if PRIV_SEP_MODE == PRIV_SEP_MODE_PROCESS
++    #include <sys/select.h>
++#elif PRIV_SEP_MODE == PRIV_SEP_MODE_MPK
++    volatile int priv_sep_mpk_state = 0;
++    volatile bool priv_sep_mpk_init_complete = false;
++#endif
++
++#if PRIV_SEP_MODE == PRIV_SEP_MODE_PROCESS
++static int current_operation_counter = 0;
++
++//
++// Installs a pkey sent via RPC into the encryption process
++//
++void install_priv_sep_pkey(unsigned char *raw_data) {
++    PackedRSA *packed = (PackedRSA *) raw_data;  // We use the pointer directly as it's a struct
++
++    // No #else block means that with no privilege separation this code won't build.
++    // That is a good thing.
++    #if PRIV_SEP_MODE == PRIV_SEP_MODE_PROCESS
++        RSA *rsa = RSA_new();
++    #elif PRIV_SEP_MODE == PRIV_SEP_MODE_MPK
++        RSA *rsa = RSA_new_method_mmap(NULL);
++        if (rsa == NULL) {
++            puts("ERROR! RSA is NULL");
++            exit(1);
++        }
++    #endif
++
++    unsigned int offset = sizeof(PackedRSA);
++
++    BIGNUM *n = BN_bin2bn(raw_data + offset, packed->n_size, NULL);
++    offset += packed->n_size;
++
++    BIGNUM *e = BN_bin2bn(raw_data + offset, packed->e_size, NULL);
++    offset += packed->e_size;
++
++    BIGNUM *d = BN_bin2bn(raw_data + offset, packed->d_size, NULL);
++    offset += packed->d_size;
++
++    RSA_set0_key(rsa, n, e, d);
++    
++    BIGNUM *p = BN_bin2bn(raw_data + offset, packed->p_size, NULL);
++    offset += packed->p_size;
++
++    BIGNUM *q = BN_bin2bn(raw_data + offset, packed->q_size, NULL);
++    offset += packed->q_size;
++    
++    RSA_set0_factors(rsa, p, q);
++
++    BIGNUM *dmp1 = BN_bin2bn(raw_data + offset, packed->dmp1_size, NULL);
++    offset += packed->dmp1_size;
++
++    BIGNUM *dmq1 = BN_bin2bn(raw_data + offset, packed->dmq1_size, NULL);
++    offset += packed->dmq1_size;
++
++    BIGNUM *iqmp = BN_bin2bn(raw_data + offset, packed->iqmp_size, NULL);
++    offset += packed->iqmp_size;
++
++    RSA_set0_crt_params(rsa, dmp1, dmq1, iqmp);
++
++    RSA_set_method(rsa, packed->meth);
++    #ifdef PRIV_SEP_DEBUG
++    printf("Passed flags: %d, new flags: %d", packed->flags, RSA_flags(rsa));
++    #endif
++
++    priv_sep_rsa = rsa;
++    #ifdef PRIV_SEP_DEBUG
++    dump_rsa(priv_sep_rsa);
++    #endif
++}
++
++void decrypt_data(unsigned char *raw_data) {
++    
++}
++
++void encrypt_data(unsigned char *raw_data) {
++    // Pull the header directly from the raw data by cast
++    PrivSepDataEncryptHeader *header = (PrivSepDataEncryptHeader *) raw_data;
++
++    #ifdef PRIV_SEP_DEBUG
++    printf(
++        "Encryption ID %lu (PID: %ld, Counter: %d)",
++        header->id,
++        header->id >> (sizeof(unsigned long) / 2 * 8),
++        header->id && UINT_MAX
++    );
++    #endif
++
++    unsigned char *to = malloc(RSA_size(priv_sep_rsa));
++
++    #ifdef PRIV_SEP_DEBUG
++    puts("About to encrypt input data");
++    #endif
++
++    int result_len = RSA_private_encrypt(
++        header->flen,
++        raw_data + sizeof(PrivSepDataEncryptHeader), // From: raw_data + header
++        to,
++        priv_sep_rsa,
++        header->padding
++    );
++    #ifdef PRIV_SEP_DEBUG
++    puts("Data encrypted!");
++    #endif
++
++    int resp_data_len = sizeof(PrivSepRpcRespHeader) + result_len;
++
++    unsigned char* response_data = malloc(resp_data_len);
++    PrivSepRpcRespHeader *resp_header = (PrivSepRpcRespHeader *) response_data;
++    resp_header->len = result_len;
++    resp_header->response_type = PRIV_SEP_RPC_RESPONSE_ENC;
++    memcpy(response_data + sizeof(PrivSepRpcRespHeader), to, result_len);
++    int offset = 0;
++
++    #ifdef PRIV_SEP_DEBUG
++    printf("Sending encrypted data with size: %d back...\n", result_len);
++    #endif
++
++    while (offset < resp_data_len) {
++        offset += write(
++            priv_sep_config->sockets_done[0],
++            response_data + offset,
++            resp_data_len - offset
++        );
++    }
++
++    #ifdef PRIV_SEP_DEBUG
++    printf("Data sent back!\n");
++    #endif
++
++    free(response_data);
++    free(to);
++}
++
++void
++send_rpc(int action, unsigned char *input_data, size_t input_data_length, int fd)
++{
++    PrivSepRpcHeader *header = calloc(1, sizeof(PrivSepRpcHeader));
++    unsigned char *packet = calloc(1, sizeof(PrivSepRpcHeader) + input_data_length);
++
++    header->action = action;
++    header->input_data_length = input_data_length;
++    header->rpc_id = current_operation_counter << (
++        (sizeof(long) * 8 / 2 ) | (rand() % (2^(sizeof(long) * 8)))
++    );
++
++    current_operation_counter++;
++
++    memcpy(packet, header, sizeof(PrivSepRpcHeader));
++    memcpy(packet + sizeof(PrivSepRpcHeader), input_data, input_data_length);
++    int bytes = write(fd, packet, sizeof(PrivSepRpcHeader) + input_data_length);
++
++    if (bytes != sizeof(PrivSepRpcHeader) + input_data_length) {
++        puts("ERROR - Unhandled: wrong number of bytes sent via RPC");
++        exit(1);
++    }
++    #ifdef PRIV_SEP_DEBUG
++    puts("RPC data sent...");
++    #endif
++}
++
++//
++// Processes incoming RPC data blobs
++//
++void handle_incoming_rpc(PrivSepRpcHeader* header, unsigned char *data) {
++    #ifdef PRIV_SEP_DEBUG
++    printf("Incoming RPC, ID: %lu\n", header->rpc_id);
++    #endif
++
++    switch(header->action) {
++        case PRIV_SEP_RPC_HELLO:
++            #ifdef PRIV_SEP_DEBUG
++            printf("New process initialised! My PID is %d\n", (int) getpid());
++            printf("Hello data: %s\n", data);
++            #endif // PRIV_SEP_DEBUG
++            break;
++        case PRIV_SEP_RPC_PKEY_INSTALL:
++            #ifdef PRIV_SEP_DEBUG
++            printf("Installing a private key...\n");
++            #endif
++            install_priv_sep_pkey(data);
++            break;
++        case PRIV_SEP_RPC_ENCRYPT:
++            #ifdef PRIV_SEP_DEBUG
++            printf("Encrypting some data...\n");
++            #endif
++            encrypt_data(data);
++            break;
++        case PRIV_SEP_RPC_DECRYPT:
++            #ifdef PRIV_SEP_DEBUG
++            printf("Decypting some data...\n");
++            #endif
++            decrypt_data(data);
++            break;
++        default:
++            #ifdef PRIV_SEP_DEBUG
++            printf("Unknown RPC (type %d) received.\n", header->action);
++            #endif
++            break;
++    }
++    free(header);
++    free(data);
++}
++
++void encryption_subprocess_run_loop()
++{
++    // Infinite loop to read data from the socket
++    #ifdef PRIV_SEP_DEBUG
++    puts("Starting RPC run loop... (this should only happen once!)");
++    #endif
++    PrivSepRpcHeader *header;
++    unsigned char *data;
++    
++    int workrfd = priv_sep_config->sockets_work[1];
++
++    while ( true ) {
++        int result;
++        fd_set rfds;
++        do {
++            FD_ZERO(&rfds);
++            FD_SET(workrfd, &rfds);
++            result = select(workrfd + 1, &rfds, NULL, NULL, NULL);
++        } while (result < 0);
++        if (FD_ISSET(workrfd, &rfds)) {
++            header = calloc(1, sizeof(PrivSepRpcHeader));
++            int offset = 0;
++            int data_size = sizeof(PrivSepRpcHeader);
++
++            // We can't rely on read being perfect, like, ever.
++            while (offset < data_size) {
++                offset += read(workrfd, (void *) (header + offset), data_size - offset);
++            }
++
++            offset = 0;
++            data_size = header->input_data_length;
++            data = calloc(1, data_size);
++            // Again, we can't rely on read being perfect, like, ever.
++            while (offset < data_size) {
++                offset += read(workrfd, (void *) (data + offset), data_size - offset);
++            }
++            handle_incoming_rpc(header, data);
++        }
++    }
++}
++#endif /* PRIV_SEP_MODE == PRIV_SEP_MODE_PROCESS */
++
++#ifdef PRIV_SEP_DEBUG
++void dump_rsa(RSA *rsa)
++{
++    int version = RSA_get_version(rsa);
++
++    int n_size = BN_num_bytes(RSA_get0_n(rsa));
++    char *n    = BN_bn2hex(RSA_get0_n(rsa));
++
++    int e_size = BN_num_bytes(RSA_get0_e(rsa));
++    char *e    = BN_bn2hex(RSA_get0_e(rsa));
++
++    int d_size = BN_num_bytes(RSA_get0_d(rsa));
++    char *d    = BN_bn2hex(RSA_get0_d(rsa));
++
++    int p_size = BN_num_bytes(RSA_get0_p(rsa));
++    char *p    = BN_bn2hex(RSA_get0_p(rsa));
++
++    int q_size = BN_num_bytes(RSA_get0_q(rsa));
++    char *q    = BN_bn2hex(RSA_get0_q(rsa));
++    
++    int dmp1_size = BN_num_bytes(RSA_get0_dmp1(rsa));
++    char *dmp1 = BN_bn2hex(RSA_get0_dmp1(rsa));
++
++    int dmq1_size = BN_num_bytes(RSA_get0_dmq1(rsa));
++    char *dmq1 = BN_bn2hex(RSA_get0_dmq1(rsa));
++    
++    int iqmp_size = BN_num_bytes(RSA_get0_iqmp(rsa));
++    char *iqmp = BN_bn2hex(RSA_get0_iqmp(rsa));
++
++    printf("-- RSA DUMP [version: %d] --\n", version);
++    printf("n [%db]: %s\n", n_size, n);
++    printf("e [%db]: %s\n", e_size, e);
++    printf("d [%db]: %s\n", d_size, d);
++    printf("p [%db]: %s\n", p_size, p);
++    printf("q [%db]: %s\n", q_size, q);
++    printf("dmp1 [%db]: %s\n", dmp1_size, dmp1);
++    printf("dmq1 [%db]: %s\n", dmq1_size, dmq1);
++    printf("iqmp [%db]: %s\n", iqmp_size, iqmp);
++    printf("-- END DUMP --\n");
++}
++#endif // PRIV_SEP_DEBUG
++
++#ifdef PRIV_SEP_DEBUG
++void print_backtrace(const char *caller) {
++    void *array[20];
++    size_t size;
++    int i;
++    printf("-- Begin Stack Trace for %s --\n", caller);
++    size = backtrace(array, 20);
++    char **strings = backtrace_symbols(array, size);
++
++    for (i = 0; i < size; i++)
++        printf("%s\n", strings[i]);
++
++    // backtrace_symbols_fd(array, size, 2);
++    printf("-- End Stack Trace --\n");
++}
++#endif // PRIV_SEP_DEBUG
++
++#if PRIV_SEP_MODE == PRIV_SEP_MODE_MPK
++void pkey_mprotect_wrapper(int pkey, void *page)
++{
++    // Process access level is standard r/w
++    // Therefore, protection only happens if pku/ospke are enabled
++    int ret = pkey_mprotect(
++        page,
++        getpagesize(),
++        PROT_WRITE|PROT_READ,
++        pkey
++    );
++    #ifdef PRIV_SEP_DEBUG
++    printf("pkey mprotect result: %d\n", ret);
++    #endif
++}
++
++void *encryption_thread_worker_loop(void *param)
++{
++    #ifdef PRIV_SEP_DEBUG
++    printf("Entering encryption thread worker loop\n");
++    #endif
++
++    // Now ensure this thread can see, but not edit, the private key
++    int pkey = pkey_alloc(0, PKEY_DISABLE_WRITE);
++    // Protect the n value of the private key
++    pkey_mprotect_wrapper(pkey, RSA_get0_n(priv_sep_rsa));
++    // Protect the e value of the private key
++    pkey_mprotect_wrapper(pkey, RSA_get0_e(priv_sep_rsa));
++    // Protect the d value of the private key
++    pkey_mprotect_wrapper(pkey, RSA_get0_d(priv_sep_rsa));
++
++    while (1)
++    {
++        #ifdef PRIV_SEP_DEBUG
++        puts("Waiting for encryption work");
++        #endif
++
++        while (priv_sep_mpk_state == 0)
++            pthread_cond_wait(
++                &priv_sep_config->req_nonempty_cond,
++                &priv_sep_config->mutex
++            );
++
++        #ifdef PRIV_SEP_DEBUG
++        puts("req_nonempty_cond passed");
++        #endif
++
++        // Perform the encryption
++        priv_sep_config->ret = RSA_private_encrypt(
++            priv_sep_config->flen,
++            (const unsigned char *) priv_sep_config->from,
++            priv_sep_config->to,
++            priv_sep_rsa,
++            priv_sep_config->padding
++        );
++
++        #ifdef PRIV_SEP_DEBUG
++        puts("Encryption completed");
++        #endif
++        // Restore state back so that another encryption
++        // operation can be done
++
++        priv_sep_mpk_state = 0;
++        pthread_cond_signal(&priv_sep_config->resp_nonempty_cond);
++
++        #ifdef PRIV_SEP_DEBUG
++        puts("Broadcasted and unlocked resp_nonempty_cond");
++        #endif
++    }
++}
++
++void setup_work_pthread()
++{
++    #ifdef PRIV_SEP_DEBUG
++    printf("Welcome to the encryption pthread setup!\n");
++    #endif // PRIV_SEP_DEBUG
++
++    pthread_cond_init(&priv_sep_config->req_nonempty_cond, NULL);
++    pthread_cond_init(&priv_sep_config->resp_nonempty_cond, NULL);
++    pthread_mutex_init(&priv_sep_config->mutex, NULL);
++
++    priv_sep_mpk_state = 0;
++
++    // Initially lock the request nonempty mutex to prevent
++    // Undefined Behaviour when a locked mutex is unlocked.
++    pthread_mutex_lock(&priv_sep_config->mutex);
++
++    #ifdef PRIV_SEP_DEBUG
++    puts("pthread_mutex_lock mutex");
++    #endif
++
++    // Create a new thread that will have full access to memory
++    int ret = pthread_create(
++        &priv_sep_config->worker_thread,
++        NULL,
++        encryption_thread_worker_loop,
++        NULL
++    );
++    if (ret)
++    {
++        printf("pthread_create error: %d\n", ret);
++        exit(EXIT_FAILURE);
++    }
++
++    // Now prevent this thread from seeing the private keys
++    int pkey = pkey_alloc(0, PKEY_DISABLE_ACCESS);
++    // Protect the n value of the private key
++    pkey_mprotect_wrapper(pkey, RSA_get0_n(priv_sep_rsa));
++    // Protect the e value of the private key
++    pkey_mprotect_wrapper(pkey, RSA_get0_e(priv_sep_rsa));
++    // Protect the d value of the private key
++    pkey_mprotect_wrapper(pkey, RSA_get0_d(priv_sep_rsa));
++
++    // Test code to make sure accessing this data causes a segmentation fault, as required by MPK.
++    #ifdef PRIV_SEP_MODE_MPK_TEST_SEGFAULT
++        printf("DEBUG: Attempting to dump priv_sep_rsa->n: ");
++        int n_size = BN_num_bytes(RSA_get0_n(priv_sep_rsa));
++        char *n    = BN_bn2hex(RSA_get0_n(priv_sep_rsa));
++        printf("n [%db]: %s\n\n", n_size, n);
++
++        printf("DEBUG: Attempting to dump priv_sep_rsa->e: ");
++        int e_size = BN_num_bytes(RSA_get0_e(priv_sep_rsa));
++        char *e    = BN_bn2hex(RSA_get0_e(priv_sep_rsa));
++        printf("e [%db]: %s\n\n", e_size, e);
++
++        printf("DEBUG: Attempting to dump priv_sep_rsa->d: ");
++        int d_size = BN_num_bytes(RSA_get0_d(priv_sep_rsa));
++        char *d    = BN_bn2hex(RSA_get0_d(priv_sep_rsa));
++        printf("d [%db]: %s\n", d_size, d);
++    #endif
++}
++
++// Modification of BN_dup function to copy BIGNUM components into
++// mmap'd memory instead of malloc'd memory so that MPK can be used.
++BIGNUM *BN_dup_mmap(const BIGNUM *a)
++{
++    if (a == NULL)
++        return NULL;
++    // bn_check_top(a);
++
++    BIGNUM *t = mmap(
++        NULL,
++        getpagesize(),
++        PROT_READ | PROT_WRITE,
++        MAP_PRIVATE | MAP_ANONYMOUS,
++        -1,
++        0
++    );
++
++    if (t == NULL)
++    {
++        puts("!!! UNHANDLED MMAP ERROR IN BN DUP!!!");
++        return NULL;
++    }
++
++    // Equivalent of zalloc
++    memset((void *) t, 0, getpagesize());
++
++    // This is kind of a lie since it's mmap'd, but that's fine?
++    BN_set_flags(t, BN_FLG_MALLOCED);
++    // t ->flags = BN_FLG_MALLOCED;
++    // bn_check_top(t);
++    if (BN_get_flags(a, BN_FLG_SECURE))
++    {
++        // t->flags |= BN_FLG_SECURE;
++        BN_set_flags(t, BN_FLG_SECURE);
++    }
++
++    if (!BN_copy(t, a))
++    {
++        munmap(t, getpagesize());
++        return NULL;
++    }
++
++    return t;
++}
++
++#endif /* PRIV_SEP_MODE == PRIV_SEP_MODE_MPK */
++#endif /* PRIV_SEP_FUNC_ENABLED */
++
++#ifdef PRIV_SEP_BENCHMARK
++// Write out a benchmark value to file
++// This operation could take a *long* time as it uses potentially blocking IO
++// It should not be called while other benchmarks are running
++void write_benchmark_val(bool is_rsa, unsigned long long measurement)
++{
++    // Open the output file for append
++    FILE *fp = fopen(PRIV_SEP_BENCHMARK_FILENAME, "a");
++    char *type_str = is_rsa ? "rsa" : "full";
++
++    printf(
++        "%s encryption cycles [%s]: %llu\n",
++        type_str,
++        PRIV_SEP_BENCHMARK_FILENAME_TYPE,
++        measurement
++    );
++
++    fprintf(fp, "%s,%llu\n", type_str, measurement);
++
++    fclose(fp);
++}
++#endif /* PRIV_SEP_BENCHMARK */
++
++unsigned int calculate_mmap_size(size_t item_size)
++{
++    // Align an mmap'd area of memory to the page size
++    // Inspired by https://stackoverflow.com/q/28858802
++
++    unsigned int page_size = getpagesize();
++    unsigned int pages = item_size / page_size;
++    unsigned int remainder = item_size % page_size;
++    if (remainder)
++        pages++;
++
++    unsigned int size = pages * page_size;
++
++    #ifdef PRIV_SEP_DEBUG
++    printf("DEBUG: mmap size calculated as %d bytes\n", size);
++    #endif
++
++    return size;
++}
+diff --git a/openssl-1.1.1/crypto/rpc/rpc.h b/openssl-1.1.1/crypto/rpc/rpc.h
+new file mode 100644
+index 00000000..df7636f7
+--- /dev/null
++++ b/openssl-1.1.1/crypto/rpc/rpc.h
+@@ -0,0 +1,211 @@
++// Imports that are always needed regardless of whether priv
++// sep is enabled or not.
++#define _GNU_SOURCE
++#include <unistd.h>
++#include <stdbool.h>
++
++// Global switch to enable or disable Privilege Separation
++#define PRIV_SEP_FUNC_ENABLED
++
++// Define PRIV_SEP_BENCHMARK to enable microbenchmarking
++#define PRIV_SEP_BENCHMARK
++
++// Set the benchmark phase
++// Phase 1: RSA operation only
++// Phase 2: Entire rsa_ossl_private_encrypt, including the crypto
++#define PRIV_SEP_BENCHMARK_PHASE 2
++
++// ID of each Privilege Separation mode
++#define PRIV_SEP_MODE_PROCESS 1
++#define PRIV_SEP_MODE_MPK 2
++
++// Which Privilege Separation mode to use (based on the above)
++#define PRIV_SEP_MODE PRIV_SEP_MODE_MPK
++
++// Only bother declaring the rest if the developer has enabled priv sep
++#ifdef PRIV_SEP_FUNC_ENABLED
++
++// Define PRIV_SEP_DEBUG to enable textual output from the priv sep code
++#define PRIV_SEP_DEBUG
++
++#include <openssl/rsa.h>
++
++#if PRIV_SEP_MODE == PRIV_SEP_MODE_MPK
++    // Define _GNU_SOURCE so that we get the GNU extensions, including MPK
++    #include <pthread.h>
++    #include <sys/mman.h>
++    #include <openssl/bn.h>
++
++    // Define PRIV_SEP_MODE_MPK_TEST_SEGFAULT to ensure accessing memory locked by MPK results in a segmentation fault.
++    // This is for feature testing only, and must be disabled for Nginx to work!
++    #define PRIV_SEP_MODE_MPK_TEST_SEGFAULT
++
++#endif
++
++#define PRIV_SEP_RPC_HELLO 1
++#define PRIV_SEP_RPC_PKEY_INSTALL 10
++#define PRIV_SEP_RPC_ENCRYPT 11
++#define PRIV_SEP_RPC_DECRYPT 12
++
++#define PRIV_SEP_WAIT_FLAG -1000
++
++#define PRIV_SEP_RPC_RESPONSE_ENC 1
++
++void send_rpc(int action, unsigned char *input_data, size_t input_data_length, int fd);
++
++typedef struct priv_sep_config_data_st {
++    /*
++     * Privilege Separation Data
++     * This is how the two processes will communicate across channels
++     */
++    // Process based separation
++    unsigned int encryption_stub_ctx;
++    pid_t encryption_pid;
++    int sockets_work[2];
++    int sockets_done[2];
++
++    #if PRIV_SEP_MODE == PRIV_SEP_MODE_MPK
++        // Thread based separation
++        pthread_t worker_thread;
++        pthread_cond_t  req_nonempty_cond;
++        pthread_cond_t  resp_nonempty_cond;
++        pthread_mutex_t mutex;
++
++        // RSA Work, thread-based
++        int flen;
++        int padding;
++        unsigned char* from;
++        unsigned char* to;
++        int ret;
++    #endif /* PRIV_SEP_MODE == PRIV_SEP_MODE_MPK */
++} PrivSepConfigData;
++
++extern PrivSepConfigData *priv_sep_config;
++
++RSA *priv_sep_rsa;
++
++#if PRIV_SEP_MODE == PRIV_SEP_MODE_MPK
++extern volatile int priv_sep_mpk_state;
++extern volatile bool priv_sep_mpk_init_complete;
++#endif
++
++#if PRIV_SEP_MODE == PRIV_SEP_MODE_PROCESS
++typedef struct packed_rsa {
++    int32_t version;
++    int flags;
++    const RSA_METHOD *meth;
++    ENGINE *engine;
++
++    // Big numbers
++    size_t n_size;
++    size_t e_size;
++    size_t d_size;
++    size_t p_size;
++    size_t q_size;
++    size_t dmp1_size;
++    size_t dmq1_size;
++    size_t iqmp_size;
++
++    unsigned int total_size;  // Sanity check
++} PackedRSA;
++
++typedef struct priv_sep_rpc_header_st {
++    unsigned int action;
++    unsigned long rpc_id;
++    size_t input_data_length;
++} PrivSepRpcHeader;
++
++typedef struct packed_rsa_data {
++    unsigned char *packed;
++    unsigned int len;
++    PackedRSA *packed_rsa;
++} FullPackedRSAData;
++
++typedef struct data_encrypt_header_st {
++    int flen;           // Length of the data to encrypt
++    int padding;        // RSA Padding data
++    unsigned long id;   // ID for the request
++} PrivSepDataEncryptHeader;
++
++typedef struct pkey_operation_done_header_st {
++    int response_type;
++    int len;
++} PrivSepRpcRespHeader;
++
++void encryption_subprocess_run_loop();
++void handle_incoming_rpc(PrivSepRpcHeader* header, unsigned char *data);
++#endif
++
++// These functions are for debug only and should be disabled
++// when building for production
++#ifdef PRIV_SEP_DEBUG
++void dump_rsa(RSA* rsa);
++void print_backtrace(const char *caller);
++#endif // PRIV_SEP_DEBUG
++
++#if PRIV_SEP_MODE == PRIV_SEP_MODE_MPK
++// Set up a worker thread and save its thread id
++void setup_work_pthread();
++BIGNUM *BN_dup_mmap(const BIGNUM *a);
++
++#endif /* PRIV_SEP_MODE == PRIV_SEP_MODE_MPK */
++#endif /* PRIV_SEP_FUNC_ENABLED */
++
++#ifdef PRIV_SEP_BENCHMARK
++// Reads the rdtsc register for high precision timing
++// Credit to:
++// - https://www.intel.de/content/dam/www/public/us/en/documents/white-papers/ia-32-ia-64-benchmark-code-execution-paper.pdf
++// - https://gcc.gnu.org/onlinedocs/gcc/Machine-Constraints.html 
++
++unsigned long long inline rdtsc_before() __attribute__((always_inline));
++unsigned long long inline rdtsc_before()
++{
++    unsigned long long ticksl, ticksh;
++    __asm__ __volatile__(
++        "CPUID\n\t"
++        "RDTSC\n\t"
++        "mov %%rdx, %0\n\t"
++        "mov %%rax, %1\n\t": "=r" (ticksh), "=r" (ticksl):: "%rax", "%rbx", "%rcx", "%rdx"
++    );
++
++    return (ticksh << 32) | ticksl;
++}
++
++unsigned long long inline rdtsc_after() __attribute__((always_inline));
++unsigned long long inline rdtsc_after()
++{
++    unsigned long long ticksl, ticksh;
++    __asm__ __volatile__(
++        "RDTSCP\n\t"
++        "mov %%rdx, %0\n\t"
++        "mov %%rax, %1\n\t"
++        "CPUID\n\t": "=r"(ticksh), "=r"(ticksl)::"%rax", "%rbx", "%rcx", "%rdx"
++    );
++
++    return (ticksh << 32) | ticksl;
++}
++
++// Write measurements to a CSV-esque file
++// This will be very rudimentary, but enough to get many samples
++#ifdef PRIV_SEP_FUNC_ENABLED
++    #if PRIV_SEP_MODE == PRIV_SEP_MODE_PROCESS
++        #define PRIV_SEP_BENCHMARK_FILENAME_TYPE "process"
++    #elif PRIV_SEP_MODE == PRIV_SEP_MODE_MPK
++        #define PRIV_SEP_BENCHMARK_FILENAME_TYPE "mpk"
++    #else
++        #define PRIV_SEP_BENCHMARK_FILENAME_TYPE "unknown"
++    #endif
++#else
++    #define PRIV_SEP_BENCHMARK_FILENAME_TYPE "vanilla"
++#endif
++#define PRIV_SEP_BENCHMARK_FILENAME "priv_sep_benchmark_"  PRIV_SEP_BENCHMARK_FILENAME_TYPE ".csv"
++
++void write_benchmark_val(bool is_rsa, unsigned long long measurement);
++
++#endif /* PRIV_SEP_BENCHMARK */
++
++// Calculate an mmap size page size aligned
++// Keeping this function unconditionally included so that
++// I don't need to have #ifdefs in rsa_lib.c
++// Don't want to deal with all those #if guards.
++unsigned int calculate_mmap_size(size_t item_size);
+diff --git a/openssl-1.1.1/crypto/rsa/rsa_lib.c b/openssl-1.1.1/crypto/rsa/rsa_lib.c
+index 49c34b7c..09d37e4e 100644
+--- a/openssl-1.1.1/crypto/rsa/rsa_lib.c
++++ b/openssl-1.1.1/crypto/rsa/rsa_lib.c
+@@ -7,6 +7,8 @@
+  * https://www.openssl.org/source/license.html
+  */
+ 
++#define _GNU_SOURCE
++
+ #include <stdio.h>
+ #include <openssl/crypto.h>
+ #include "internal/cryptlib.h"
+@@ -17,6 +19,10 @@
+ #include "internal/evp_int.h"
+ #include "rsa_locl.h"
+ 
++#include <crypto/rpc/rpc.h>
++
++#include <sys/mman.h>
++
+ RSA *RSA_new(void)
+ {
+     return RSA_new_method(NULL);
+@@ -47,6 +53,72 @@ int RSA_set_method(RSA *rsa, const RSA_METHOD *meth)
+     return 1;
+ }
+ 
++RSA *RSA_new_method_mmap(ENGINE *engine)
++{
++    RSA *ret = mmap(
++        NULL,
++        calculate_mmap_size(sizeof(*ret)),
++        PROT_READ | PROT_WRITE,
++        MAP_PRIVATE | MAP_ANONYMOUS,
++        -1,
++        0
++    );
++    if (ret == MAP_FAILED) {
++        puts("Map failed for some reason.");
++        exit(1);
++    }
++    if (ret == NULL) {
++        RSAerr(RSA_F_RSA_NEW_METHOD, ERR_R_MALLOC_FAILURE);
++        return NULL;
++    }
++
++    ret->references = 1;
++    ret->lock = CRYPTO_THREAD_lock_new();
++    if (ret->lock == NULL) {
++        RSAerr(RSA_F_RSA_NEW_METHOD, ERR_R_MALLOC_FAILURE);
++        munmap(ret, calculate_mmap_size(sizeof(*ret)));
++        return NULL;
++    }
++
++    ret->meth = RSA_get_default_method();
++#ifndef OPENSSL_NO_ENGINE
++    ret->flags = ret->meth->flags & ~RSA_FLAG_NON_FIPS_ALLOW;
++    if (engine) {
++        if (!ENGINE_init(engine)) {
++            RSAerr(RSA_F_RSA_NEW_METHOD, ERR_R_ENGINE_LIB);
++            goto err;
++        }
++        ret->engine = engine;
++    } else {
++        ret->engine = ENGINE_get_default_RSA();
++    }
++    if (ret->engine) {
++        ret->meth = ENGINE_get_RSA(ret->engine);
++        if (ret->meth == NULL) {
++            RSAerr(RSA_F_RSA_NEW_METHOD, ERR_R_ENGINE_LIB);
++            goto err;
++        }
++    }
++#endif
++
++    ret->flags = ret->meth->flags & ~RSA_FLAG_NON_FIPS_ALLOW;
++    if (!CRYPTO_new_ex_data(CRYPTO_EX_INDEX_RSA, ret, &ret->ex_data)) {
++        goto err;
++    }
++
++    if ((ret->meth->init != NULL) && !ret->meth->init(ret)) {
++        RSAerr(RSA_F_RSA_NEW_METHOD, ERR_R_INIT_FAIL);
++        goto err;
++    }
++
++    return ret;
++
++ err:
++    RSA_free(ret);
++    return NULL;
++
++}
++
+ RSA *RSA_new_method(ENGINE *engine)
+ {
+     RSA *ret = OPENSSL_zalloc(sizeof(*ret));
+@@ -141,6 +213,16 @@ void RSA_free(RSA *r)
+     OPENSSL_free(r);
+ }
+ 
++int RSA_clear_private(RSA *r)
++{
++    BN_clear_free(r->d);
++    BN_clear_free(r->p);
++    BN_clear_free(r->q);
++    BN_clear_free(r->dmp1);
++    BN_clear_free(r->dmq1);
++    BN_clear_free(r->iqmp);
++}
++
+ int RSA_up_ref(RSA *r)
+ {
+     int i;
+diff --git a/openssl-1.1.1/crypto/rsa/rsa_ossl.c b/openssl-1.1.1/crypto/rsa/rsa_ossl.c
+index 46513425..381723a3 100644
+--- a/openssl-1.1.1/crypto/rsa/rsa_ossl.c
++++ b/openssl-1.1.1/crypto/rsa/rsa_ossl.c
+@@ -11,6 +11,9 @@
+ #include "internal/bn_int.h"
+ #include "rsa_locl.h"
+ #include "internal/constant_time_locl.h"
++#include <crypto/rpc/rpc.h>
++#include <assert.h>
++#include <stdbool.h>
+ 
+ static int rsa_ossl_public_encrypt(int flen, const unsigned char *from,
+                                   unsigned char *to, RSA *rsa, int padding);
+@@ -230,20 +233,487 @@ static int rsa_blinding_invert(BN_BLINDING *b, BIGNUM *f, BIGNUM *unblind,
+     return BN_BLINDING_invert_ex(f, unblind, b, ctx);
+ }
+ 
++#ifdef PRIV_SEP_FUNC_ENABLED
++#if PRIV_SEP_MODE == PRIV_SEP_MODE_PROCESS
++    static unsigned int counter = 0;
++#endif
++#endif // PRIV_SEP_FUNC_ENABLED
++
+ /* signing */
++#ifdef PRIV_SEP_FUNC_ENABLED
++
++#if PRIV_SEP_MODE == PRIV_SEP_MODE_PROCESS
++
+ static int rsa_ossl_private_encrypt(int flen, const unsigned char *from,
+                                    unsigned char *to, RSA *rsa, int padding)
+ {
+-    BIGNUM *f, *ret, *res;
+-    int i, num = 0, r = -1;
+-    unsigned char *buf = NULL;
++    #ifdef PRIV_SEP_DEBUG
++    printf("RSA OSSL Private Encrypt. flen: %d, padding: %d\n", flen, padding);
++    #endif
++
++    #if defined(PRIV_SEP_BENCHMARK) && PRIV_SEP_BENCHMARK_PHASE == 2
++    unsigned long long total_ticks_before = rdtsc_before();
++    #endif
++
++    int r = -1;
++
++    // Check if we are in the worker or the encryption process
++    if (priv_sep_config->encryption_pid == 0) {
++        #ifdef PRIV_SEP_DEBUG
++        puts("Entered encryption function from the encryption process");
++        printf("Data to be encrypted [len: %d]:", flen);
++        #endif
++
++        #if defined(PRIV_SEP_BENCHMARK) && PRIV_SEP_BENCHMARK_PHASE == 1
++        unsigned long long rsa_ticks_before = rdtsc_before();
++        #endif
++
++        int num = 0, i = 0;
++        BN_CTX *ctx = NULL;
++        unsigned char *buf = NULL;
++
++        // We are in the encryption process (e.g. the fork()'d child)
++        BIGNUM *f, *ret, *res;
++        int local_blinding = 0;
++        /*
++        * Used only if the blinding structure is shared. A non-NULL unblind
++        * instructs rsa_blinding_convert() and rsa_blinding_invert() to store
++        * the unblinding factor outside the blinding structure.
++        */
++        BIGNUM *unblind = NULL;
++        BN_BLINDING *blinding = NULL;
++
++        if ((ctx = BN_CTX_new()) == NULL)
++            goto err;
++        BN_CTX_start(ctx);
++        f = BN_CTX_get(ctx);
++        ret = BN_CTX_get(ctx);
++        num = BN_num_bytes(rsa->n);
++        buf = OPENSSL_malloc(num);
++        if (ret == NULL || buf == NULL) {
++            RSAerr(RSA_F_RSA_OSSL_PRIVATE_ENCRYPT, ERR_R_MALLOC_FAILURE);
++            goto err;
++        }
++
++        #ifdef PRIV_SEP_DEBUG
++        printf("Padding type: %d\n", padding);
++        #endif
++
++        switch (padding) {
++        case RSA_PKCS1_PADDING:
++            i = RSA_padding_add_PKCS1_type_1(buf, num, from, flen);
++            break;
++        case RSA_X931_PADDING:
++            i = RSA_padding_add_X931(buf, num, from, flen);
++            break;
++        case RSA_NO_PADDING:
++            i = RSA_padding_add_none(buf, num, from, flen);
++            break;
++        case RSA_SSLV23_PADDING:
++        default:
++            RSAerr(RSA_F_RSA_OSSL_PRIVATE_ENCRYPT, RSA_R_UNKNOWN_PADDING_TYPE);
++            goto err;
++        }
++        if (i <= 0)
++            goto err;
++
++        if (BN_bin2bn(buf, num, f) == NULL)
++            goto err;
++
++        if (BN_ucmp(f, rsa->n) >= 0) {
++            /* usually the padding functions would catch this */
++            RSAerr(RSA_F_RSA_OSSL_PRIVATE_ENCRYPT,
++                RSA_R_DATA_TOO_LARGE_FOR_MODULUS);
++            goto err;
++        }
++
++        if (rsa->flags & RSA_FLAG_CACHE_PUBLIC)
++            if (!BN_MONT_CTX_set_locked(&rsa->_method_mod_n, rsa->lock,
++                                        rsa->n, ctx))
++                goto err;
++
++        if (!(rsa->flags & RSA_FLAG_NO_BLINDING)) {
++            blinding = rsa_get_blinding(rsa, &local_blinding, ctx);
++            if (blinding == NULL) {
++                RSAerr(RSA_F_RSA_OSSL_PRIVATE_ENCRYPT, ERR_R_INTERNAL_ERROR);
++                goto err;
++            }
++        }
++
++        if (blinding != NULL) {
++            if (!local_blinding && ((unblind = BN_CTX_get(ctx)) == NULL)) {
++                RSAerr(RSA_F_RSA_OSSL_PRIVATE_ENCRYPT, ERR_R_MALLOC_FAILURE);
++                goto err;
++            }
++            if (!rsa_blinding_convert(blinding, f, unblind, ctx))
++                goto err;
++        }
++
++        if ((rsa->flags & RSA_FLAG_EXT_PKEY) ||
++            (rsa->version == RSA_ASN1_VERSION_MULTI) ||
++            ((rsa->p != NULL) &&
++            (rsa->q != NULL) &&
++            (rsa->dmp1 != NULL) && (rsa->dmq1 != NULL) && (rsa->iqmp != NULL))) {
++            if (!rsa->meth->rsa_mod_exp(ret, f, rsa, ctx))
++                goto err;
++        } else {
++            BIGNUM *d = BN_new();
++            if (d == NULL) {
++                RSAerr(RSA_F_RSA_OSSL_PRIVATE_ENCRYPT, ERR_R_MALLOC_FAILURE);
++                goto err;
++            }
++            BN_with_flags(d, rsa->d, BN_FLG_CONSTTIME);
++
++            if (!rsa->meth->bn_mod_exp(ret, f, d, rsa->n, ctx,
++                                    rsa->_method_mod_n)) {
++                BN_free(d);
++                goto err;
++            }
++            /* We MUST free d before any further use of rsa->d */
++            BN_free(d);
++        }
++
++        if (blinding)
++            if (!rsa_blinding_invert(blinding, ret, unblind, ctx))
++                goto err;
++
++        if (padding == RSA_X931_PADDING) {
++            if (!BN_sub(f, rsa->n, ret))
++                goto err;
++            if (BN_cmp(ret, f) > 0)
++                res = f;
++            else
++                res = ret;
++        } else {
++            res = ret;
++        }
++
++        /*
++        * BN_bn2binpad puts in leading 0 bytes if the number is less than
++        * the length of the modulus.
++        */
++
++        r = BN_bn2binpad(res, to, num);
++
++    err:
++        if (ctx != NULL)
++            BN_CTX_end(ctx);
++        BN_CTX_free(ctx);
++        OPENSSL_clear_free(buf, num);
++        
++        #if defined(PRIV_SEP_BENCHMARK) && PRIV_SEP_BENCHMARK_PHASE == 1
++        unsigned long long rsa_ticks_result = rdtsc_after() - rsa_ticks_before;
++        write_benchmark_val(true, rsa_ticks_result);
++        #endif
++
++
++        return r;
++    }
++    else
++    {
++        #ifdef PRIV_SEP_DEBUG
++        puts("Entered encryption function from the worker process");
++        print_backtrace(__func__);
++        #endif
++        // We are in the worker process and we need to yield control over
++        // to the encryption process via the socket pair
++        unsigned char *rpc_raw_data = calloc(1, sizeof(PrivSepDataEncryptHeader) + flen);
++        PrivSepDataEncryptHeader *header = (PrivSepDataEncryptHeader *) rpc_raw_data;
++        header->flen = flen;
++        header->padding = padding;
++        counter = (counter == UINT_MAX) ? 0 : counter + 1;
++        header->id = getpid() << (sizeof(unsigned long) / 2 * 8 ) | counter;
++        memcpy(rpc_raw_data + sizeof(PrivSepDataEncryptHeader), from, flen);
++
++        send_rpc(
++            PRIV_SEP_RPC_ENCRYPT,
++            rpc_raw_data,
++            sizeof(PrivSepDataEncryptHeader) + flen,
++            priv_sep_config->sockets_work[0]
++        );
++        free(rpc_raw_data);
++        
++        int offset = 0;
++        PrivSepRpcRespHeader *resp_header = calloc(1, sizeof(PrivSepRpcRespHeader));
++        while (offset < sizeof(PrivSepRpcRespHeader)) {
++            offset += read(
++                priv_sep_config->sockets_done[1],
++                resp_header + offset,
++                sizeof(PrivSepRpcRespHeader) - offset
++            );
++        }
++
++        if (resp_header->response_type != PRIV_SEP_RPC_RESPONSE_ENC) {
++            // Bail
++            puts("!!!! Somehow the wrong type of data was received, bailing!");
++            printf(
++                "Expected: %d, received: %d",
++                PRIV_SEP_RPC_RESPONSE_ENC,
++                resp_header->response_type
++            );
++            exit(1);
++        }
++
++        offset = 0;
++        // Make sure that we have the memory set up properly for this to work.
++        // If this assertation fails there is a serious problem with the way this function is being called.
++        assert(to != NULL);
++
++        while (offset < resp_header->len) {
++            offset += read(
++                priv_sep_config->sockets_done[1],
++                to + offset,
++                resp_header->len - offset
++            );
++        }
++
++        r = resp_header->len;
++    }
++    
++
++    #if defined(PRIV_SEP_BENCHMARK) && PRIV_SEP_BENCHMARK_PHASE == 2
++    unsigned long long total_ticks_after = rdtsc_after() - total_ticks_before;
++    write_benchmark_val(false, total_ticks_after);
++    #endif
++
++    return r;
++}
++
++/* The #elif for #if PRIV_SEP_MODE == PRIV_SEP_MODE_PROCESS */
++#elif PRIV_SEP_MODE == PRIV_SEP_MODE_MPK 
++
++    static int rsa_ossl_private_encrypt(int flen, const unsigned char *from,
++                                   unsigned char *to, RSA *rsa, int padding)
++{
++    // Check if we are in the worker or the encryption thread
++    if (!priv_sep_mpk_init_complete)
++    {
++        #ifdef PRIV_SEP_DEBUG
++        printf("Not yet configured MPK; setting up now for first request\n");
++        #endif
++        setup_work_pthread();
++        priv_sep_mpk_init_complete = true;
++    }
++
++    if (priv_sep_mpk_state == 0)
++    {
++        #ifdef PRIV_SEP_DEBUG
++        puts("Entered encryption function from the worker thread");
++        #endif
++        #if defined(PRIV_SEP_BENCHMARK) && PRIV_SEP_BENCHMARK_PHASE == 2
++        unsigned long long full_ticks_before = rdtsc_before();
++        #endif
++        // Set up the request
++        priv_sep_config->flen = flen;
++        priv_sep_config->from = (unsigned char *) from;
++        priv_sep_config->padding = padding;
++        priv_sep_config->to = to;
++
++        // Switch the state so that the other if branch gets used
++        priv_sep_mpk_state = 1;
++        #ifdef PRIV_SEP_DEBUG
++        printf("Value of state: %d\n", priv_sep_mpk_state);
++        printf("Location: %p, pid: %d\n", &priv_sep_mpk_state, getpid());
++        #endif
++
++        pthread_cond_signal(&priv_sep_config->req_nonempty_cond);
++
++        #ifdef PRIV_SEP_DEBUG
++        puts("Should have woken up the encryption thread");
++        #endif
++
++        while (priv_sep_mpk_state == 1)
++            pthread_cond_wait(
++                &priv_sep_config->resp_nonempty_cond,
++                &priv_sep_config->mutex
++            );
++
++        #ifdef PRIV_SEP_DEBUG
++        puts("resp_nonempty_cond passed");
++        #endif
++
++        #if defined(PRIV_SEP_BENCHMARK) && PRIV_SEP_BENCHMARK_PHASE == 2
++             unsigned long long full_ticks_after = rdtsc_after() - full_ticks_before;
++            write_benchmark_val(false, full_ticks_after);
++        #endif
++
++        return priv_sep_config->ret;
++    }
++    else
++    {
++        #ifdef PRIV_SEP_DEBUG
++            puts("Entered encryption function from the encryption thread");
++            printf("Data to be encrypted [len: %d]:", flen);
++        #endif
++
++        #if defined(PRIV_SEP_BENCHMARK) && PRIV_SEP_BENCHMARK_PHASE == 1
++            unsigned long long rsa_ticks_before = rdtsc_before();
++        #endif
++
++        int num = 0, r = -1;
++        BN_CTX *ctx = NULL;
++        unsigned char *buf = NULL;
++        int i = 0;
++        BIGNUM *f, *ret, *res;
++
++        int local_blinding = 0;
++        /*
++        * Used only if the blinding structure is shared. A non-NULL unblind
++        * instructs rsa_blinding_convert() and rsa_blinding_invert() to store
++        * the unblinding factor outside the blinding structure.
++        */
++        BIGNUM *unblind = NULL;
++        BN_BLINDING *blinding = NULL;
++
++        if ((ctx = BN_CTX_new()) == NULL)
++            goto err;
++        BN_CTX_start(ctx);
++        f = BN_CTX_get(ctx);
++        ret = BN_CTX_get(ctx);
++        num = BN_num_bytes(rsa->n);
++        buf = OPENSSL_malloc(num);
++        if (ret == NULL || buf == NULL) {
++            RSAerr(RSA_F_RSA_OSSL_PRIVATE_ENCRYPT, ERR_R_MALLOC_FAILURE);
++            goto err;
++        }
++
++        #ifdef PRIV_SEP_DEBUG
++        printf("Padding type: %d\n", padding);
++        #endif
++
++        switch (padding) {
++        case RSA_PKCS1_PADDING:
++            i = RSA_padding_add_PKCS1_type_1(buf, num, from, flen);
++            break;
++        case RSA_X931_PADDING:
++            i = RSA_padding_add_X931(buf, num, from, flen);
++            break;
++        case RSA_NO_PADDING:
++            i = RSA_padding_add_none(buf, num, from, flen);
++            break;
++        case RSA_SSLV23_PADDING:
++        default:
++            RSAerr(RSA_F_RSA_OSSL_PRIVATE_ENCRYPT, RSA_R_UNKNOWN_PADDING_TYPE);
++            goto err;
++        }
++        if (i <= 0)
++            goto err;
++
++        if (BN_bin2bn(buf, num, f) == NULL)
++            goto err;
++
++        if (BN_ucmp(f, rsa->n) >= 0) {
++            /* usually the padding functions would catch this */
++            RSAerr(RSA_F_RSA_OSSL_PRIVATE_ENCRYPT,
++                RSA_R_DATA_TOO_LARGE_FOR_MODULUS);
++            goto err;
++        }
++
++        if (rsa->flags & RSA_FLAG_CACHE_PUBLIC)
++            if (!BN_MONT_CTX_set_locked(&rsa->_method_mod_n, rsa->lock,
++                                        rsa->n, ctx))
++                goto err;
++
++        if (!(rsa->flags & RSA_FLAG_NO_BLINDING)) {
++            blinding = rsa_get_blinding(rsa, &local_blinding, ctx);
++            if (blinding == NULL) {
++                RSAerr(RSA_F_RSA_OSSL_PRIVATE_ENCRYPT, ERR_R_INTERNAL_ERROR);
++                goto err;
++            }
++        }
++
++        if (blinding != NULL) {
++            if (!local_blinding && ((unblind = BN_CTX_get(ctx)) == NULL)) {
++                RSAerr(RSA_F_RSA_OSSL_PRIVATE_ENCRYPT, ERR_R_MALLOC_FAILURE);
++                goto err;
++            }
++            if (!rsa_blinding_convert(blinding, f, unblind, ctx))
++                goto err;
++        }
++
++        if ((rsa->flags & RSA_FLAG_EXT_PKEY) ||
++            (rsa->version == RSA_ASN1_VERSION_MULTI) ||
++            ((rsa->p != NULL) &&
++            (rsa->q != NULL) &&
++            (rsa->dmp1 != NULL) && (rsa->dmq1 != NULL) && (rsa->iqmp != NULL))) {
++            if (!rsa->meth->rsa_mod_exp(ret, f, rsa, ctx))
++                goto err;
++        } else {
++            BIGNUM *d = BN_new();
++            if (d == NULL) {
++                RSAerr(RSA_F_RSA_OSSL_PRIVATE_ENCRYPT, ERR_R_MALLOC_FAILURE);
++                goto err;
++            }
++            BN_with_flags(d, rsa->d, BN_FLG_CONSTTIME);
++
++            if (!rsa->meth->bn_mod_exp(ret, f, d, rsa->n, ctx,
++                                    rsa->_method_mod_n)) {
++                BN_free(d);
++                goto err;
++            }
++            /* We MUST free d before any further use of rsa->d */
++            BN_free(d);
++        }
++
++        if (blinding)
++            if (!rsa_blinding_invert(blinding, ret, unblind, ctx))
++                goto err;
++
++        if (padding == RSA_X931_PADDING) {
++            if (!BN_sub(f, rsa->n, ret))
++                goto err;
++            if (BN_cmp(ret, f) > 0)
++                res = f;
++            else
++                res = ret;
++        } else {
++            res = ret;
++        }
++
++        /*
++        * BN_bn2binpad puts in leading 0 bytes if the number is less than
++        * the length of the modulus.
++        */
++        r = BN_bn2binpad(res, to, num);
++    err:
++        if (ctx != NULL)
++            BN_CTX_end(ctx);
++        BN_CTX_free(ctx);
++        OPENSSL_clear_free(buf, num);
++
++        #if defined(PRIV_SEP_BENCHMARK) && PRIV_SEP_BENCHMARK_PHASE == 1
++            unsigned long long rsa_ticks_after = rdtsc_after() - rsa_ticks_before;
++            write_benchmark_val(true, rsa_ticks_after);
++        #endif
++
++        return r;
++
++    }    
++}
++
++#endif /* PRIV_SEP_MODE != PRIV_SEP_MODE_PROCESS == PRIV_SEP_MODE_MPK */
++
++#else /* PRIV_SEP_FUNC_ENABLED */
++
++// Vanilla rsa_ossl_private_encrypt function from OpenSSL 1.1.1
++static int rsa_ossl_private_encrypt(int flen, const unsigned char *from,
++                                   unsigned char *to, RSA *rsa, int padding)
++{
++    #ifdef PRIV_SEP_BENCHMARK
++    unsigned long long rsa_ticks_before = rdtsc_before();
++    #endif
++    int r = -1;
+     BN_CTX *ctx = NULL;
++    unsigned char *buf = NULL;
++    BIGNUM *f, *ret, *res;
++    int i, num = 0;
+     int local_blinding = 0;
++    
+     /*
+-     * Used only if the blinding structure is shared. A non-NULL unblind
+-     * instructs rsa_blinding_convert() and rsa_blinding_invert() to store
+-     * the unblinding factor outside the blinding structure.
+-     */
++    * Used only if the blinding structure is shared. A non-NULL unblind
++    * instructs rsa_blinding_convert() and rsa_blinding_invert() to store
++    * the unblinding factor outside the blinding structure.
++    */
+     BIGNUM *unblind = NULL;
+     BN_BLINDING *blinding = NULL;
+ 
+@@ -283,7 +753,7 @@ static int rsa_ossl_private_encrypt(int flen, const unsigned char *from,
+     if (BN_ucmp(f, rsa->n) >= 0) {
+         /* usually the padding functions would catch this */
+         RSAerr(RSA_F_RSA_OSSL_PRIVATE_ENCRYPT,
+-               RSA_R_DATA_TOO_LARGE_FOR_MODULUS);
++            RSA_R_DATA_TOO_LARGE_FOR_MODULUS);
+         goto err;
+     }
+ 
+@@ -312,8 +782,8 @@ static int rsa_ossl_private_encrypt(int flen, const unsigned char *from,
+     if ((rsa->flags & RSA_FLAG_EXT_PKEY) ||
+         (rsa->version == RSA_ASN1_VERSION_MULTI) ||
+         ((rsa->p != NULL) &&
+-         (rsa->q != NULL) &&
+-         (rsa->dmp1 != NULL) && (rsa->dmq1 != NULL) && (rsa->iqmp != NULL))) {
++        (rsa->q != NULL) &&
++        (rsa->dmp1 != NULL) && (rsa->dmq1 != NULL) && (rsa->iqmp != NULL))) {
+         if (!rsa->meth->rsa_mod_exp(ret, f, rsa, ctx))
+             goto err;
+     } else {
+@@ -325,7 +795,7 @@ static int rsa_ossl_private_encrypt(int flen, const unsigned char *from,
+         BN_with_flags(d, rsa->d, BN_FLG_CONSTTIME);
+ 
+         if (!rsa->meth->bn_mod_exp(ret, f, d, rsa->n, ctx,
+-                                   rsa->_method_mod_n)) {
++                                rsa->_method_mod_n)) {
+             BN_free(d);
+             goto err;
+         }
+@@ -349,18 +819,28 @@ static int rsa_ossl_private_encrypt(int flen, const unsigned char *from,
+     }
+ 
+     /*
+-     * BN_bn2binpad puts in leading 0 bytes if the number is less than
+-     * the length of the modulus.
+-     */
++    * BN_bn2binpad puts in leading 0 bytes if the number is less than
++    * the length of the modulus.
++    */
+     r = BN_bn2binpad(res, to, num);
++
+  err:
+     if (ctx != NULL)
+         BN_CTX_end(ctx);
+     BN_CTX_free(ctx);
+     OPENSSL_clear_free(buf, num);
++
++    #ifdef PRIV_SEP_BENCHMARK
++    unsigned long long rsa_time_taken = rdtsc_after() - rsa_ticks_before;
++    write_benchmark_val(true, rsa_time_taken);
++    #endif
++
+     return r;
+ }
+ 
++#endif /* PRIV_SEP_FUNC_ENABLED not defined */
++
++// Vanilla rsa_ossl_private_decrypt from OpenSSL 1.1.1
+ static int rsa_ossl_private_decrypt(int flen, const unsigned char *from,
+                                    unsigned char *to, RSA *rsa, int padding)
+ {
+diff --git a/openssl-1.1.1/include/openssl/rsa.h b/openssl-1.1.1/include/openssl/rsa.h
+index cdce1264..0168cddc 100644
+--- a/openssl-1.1.1/include/openssl/rsa.h
++++ b/openssl-1.1.1/include/openssl/rsa.h
+@@ -197,6 +197,7 @@ extern "C" {
+ 
+ RSA *RSA_new(void);
+ RSA *RSA_new_method(ENGINE *engine);
++RSA *RSA_new_method_mmap(ENGINE *engine);
+ int RSA_bits(const RSA *rsa);
+ int RSA_size(const RSA *rsa);
+ int RSA_security_bits(const RSA *rsa);
+@@ -263,6 +264,9 @@ void RSA_free(RSA *r);
+ /* "up" the RSA object's reference count */
+ int RSA_up_ref(RSA *r);
+ 
++// Scrub private data
++int RSA_clear_private(RSA *r);
++
+ int RSA_flags(const RSA *r);
+ 
+ void RSA_set_default_method(const RSA_METHOD *meth);
+diff --git a/openssl-1.1.1/ssl/record/rec_layer_s3.c b/openssl-1.1.1/ssl/record/rec_layer_s3.c
+index 6d495715..ec16e363 100644
+--- a/openssl-1.1.1/ssl/record/rec_layer_s3.c
++++ b/openssl-1.1.1/ssl/record/rec_layer_s3.c
+@@ -16,6 +16,8 @@
+ #include <openssl/rand.h>
+ #include "record_locl.h"
+ #include "../packet_locl.h"
++#include <crypto/rpc/rpc.h>
++
+ 
+ #if     defined(OPENSSL_SMALL_FOOTPRINT) || \
+         !(      defined(AES_ASM) &&     ( \
+@@ -1216,6 +1218,14 @@ int ssl3_read_bytes(SSL *s, int type, int *recvd_type, unsigned char *buf,
+     void (*cb) (const SSL *ssl, int type2, int val) = NULL;
+     int is_tls13 = SSL_IS_TLS13(s);
+ 
++    #ifdef PRIV_SEP_FUNC_ENABLED
++    #ifdef PRIV_SEP_DEBUG
++    printf("Is TLS 1.3? %d\n", is_tls13);
++    printf("Reached that decision as follows. Is DTLS: %d, s->method->version: %d. Min TLS 1.3 ver: %d, TLS any ver:%d\n", SSL_IS_DTLS(s), (s)->method->version, TLS1_3_VERSION, TLS_ANY_VERSION);
++    // print_backtrace(__func__);
++    #endif
++    #endif
++
+     rbuf = &s->rlayer.rbuf;
+ 
+     if (!SSL3_BUFFER_is_initialised(rbuf)) {
+@@ -1230,6 +1240,7 @@ int ssl3_read_bytes(SSL *s, int type, int *recvd_type, unsigned char *buf,
+          && (type != SSL3_RT_HANDSHAKE)) || (peek
+                                              && (type !=
+                                                  SSL3_RT_APPLICATION_DATA))) {
++        // puts("First TLS v1.3 failure point");
+         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_SSL3_READ_BYTES,
+                  ERR_R_INTERNAL_ERROR);
+         return -1;
+@@ -1298,6 +1309,7 @@ int ssl3_read_bytes(SSL *s, int type, int *recvd_type, unsigned char *buf,
+             num_recs = RECORD_LAYER_get_numrpipes(&s->rlayer);
+             if (num_recs == 0) {
+                 /* Shouldn't happen */
++                // puts("Second TLS v1.3 failure point");
+                 SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_SSL3_READ_BYTES,
+                          ERR_R_INTERNAL_ERROR);
+                 return -1;
+@@ -1328,6 +1340,7 @@ int ssl3_read_bytes(SSL *s, int type, int *recvd_type, unsigned char *buf,
+     if (s->s3->change_cipher_spec /* set when we receive ChangeCipherSpec,
+                                    * reset by ssl3_get_finished */
+         && (SSL3_RECORD_get_type(rr) != SSL3_RT_HANDSHAKE)) {
++        // puts("Third TLS v1.3 failure point");
+         SSLfatal(s, SSL_AD_UNEXPECTED_MESSAGE, SSL_F_SSL3_READ_BYTES,
+                  SSL_R_DATA_BETWEEN_CCS_AND_FINISHED);
+         return -1;
+@@ -1358,6 +1371,7 @@ int ssl3_read_bytes(SSL *s, int type, int *recvd_type, unsigned char *buf,
+          */
+         if (SSL_in_init(s) && (type == SSL3_RT_APPLICATION_DATA) &&
+             (s->enc_read_ctx == NULL)) {
++            // puts("Fourth TLS v1.3 failure point");
+             SSLfatal(s, SSL_AD_UNEXPECTED_MESSAGE, SSL_F_SSL3_READ_BYTES,
+                      SSL_R_APP_DATA_IN_HANDSHAKE);
+             return -1;
+@@ -1366,6 +1380,7 @@ int ssl3_read_bytes(SSL *s, int type, int *recvd_type, unsigned char *buf,
+         if (type == SSL3_RT_HANDSHAKE
+             && SSL3_RECORD_get_type(rr) == SSL3_RT_CHANGE_CIPHER_SPEC
+             && s->rlayer.handshake_fragment_len > 0) {
++            // puts("Fifth TLS v1.3 failure point");
+             SSLfatal(s, SSL_AD_UNEXPECTED_MESSAGE, SSL_F_SSL3_READ_BYTES,
+                      SSL_R_CCS_RECEIVED_EARLY);
+             return -1;
+@@ -1427,6 +1442,8 @@ int ssl3_read_bytes(SSL *s, int type, int *recvd_type, unsigned char *buf,
+         return 1;
+     }
+ 
++    // puts("Got an unexpected message?!");
++
+     /*
+      * If we get here, then type != rr->type; if we have a handshake message,
+      * then it was unexpected (Hello Request or Client Hello) or invalid (we
+@@ -1457,6 +1474,7 @@ int ssl3_read_bytes(SSL *s, int type, int *recvd_type, unsigned char *buf,
+          * other than a ClientHello if we are a server.
+          */
+         s->version = rr->rec_version;
++        // puts("Looks like a client heartbeat");
+         SSLfatal(s, SSL_AD_UNEXPECTED_MESSAGE, SSL_F_SSL3_READ_BYTES,
+                  SSL_R_UNEXPECTED_MESSAGE);
+         return -1;
+diff --git a/openssl-1.1.1/ssl/ssl_lib.c b/openssl-1.1.1/ssl/ssl_lib.c
+index 5bd2fcf5..337c6355 100644
+--- a/openssl-1.1.1/ssl/ssl_lib.c
++++ b/openssl-1.1.1/ssl/ssl_lib.c
+@@ -9,7 +9,9 @@
+  * https://www.openssl.org/source/license.html
+  */
+ 
++#include <stdbool.h>
+ #include <stdio.h>
++#include <sys/socket.h>
+ #include "ssl_locl.h"
+ #include <openssl/objects.h>
+ #include <openssl/x509v3.h>
+@@ -22,6 +24,7 @@
+ #include <openssl/ct.h>
+ #include "internal/cryptlib.h"
+ #include "internal/refcount.h"
++#include <crypto/rpc/rpc.h>
+ 
+ const char SSL_version_str[] = OPENSSL_VERSION_TEXT;
+ 
+@@ -3077,6 +3080,54 @@ SSL_CTX *SSL_CTX_new(const SSL_METHOD *meth)
+ 
+     ssl_ctx_system_config(ret);
+ 
++    // TODO: Make this NOT horrendous
++#ifdef PRIV_SEP_FUNC_ENABLED
++#if PRIV_SEP_MODE == PRIV_SEP_MODE_PROCESS
++    // We have never privilege separated, so configure a socket pair
++    if (priv_sep_config == NULL) {
++        priv_sep_config = calloc(1, sizeof(priv_sep_config));
++        if (socketpair(AF_UNIX, SOCK_STREAM, 0, priv_sep_config->sockets_work) != 0) {
++            puts("Error creating work socket pair!");
++            exit(1);
++        }
++        if (socketpair(AF_UNIX, SOCK_STREAM, 0, priv_sep_config->sockets_done) != 0) {
++            puts("Error creating done socket pair!");
++            exit(1);
++        }
++
++        priv_sep_config->encryption_pid = fork();
++        switch(priv_sep_config->encryption_pid) {
++            case -1:
++                puts("Error forking!");
++                exit(1);
++            case 0:
++                // Child Process
++                close(priv_sep_config->sockets_work[0]);
++                close(priv_sep_config->sockets_done[1]);
++                encryption_subprocess_run_loop();
++                break;
++            default:
++                // Parent Process
++                close(priv_sep_config->sockets_work[1]);
++                close(priv_sep_config->sockets_done[0]);
++                char *hello_data = "hello, socket pair!";
++                send_rpc(
++                    PRIV_SEP_RPC_HELLO,
++                    (unsigned char *) hello_data,
++                    strlen(hello_data) + 1,
++                    priv_sep_config->sockets_work[0]
++                );
++                break;
++        }
++
++    }
++    #ifdef PRIV_SEP_DEBUG
++    puts("Configured encryption process from parent");
++    #endif
++
++#endif /* PRIV_SEP_MODE == PRIV_SEP_MODE_PROCESS */
++#endif /* PRIV_SEP_FUNC_ENABLED */
++
+     return ret;
+  err:
+     SSLerr(SSL_F_SSL_CTX_NEW, ERR_R_MALLOC_FAILURE);
+@@ -3478,6 +3529,7 @@ int SSL_set_ssl_method(SSL *s, const SSL_METHOD *meth)
+             s->handshake_func = meth->ssl_connect;
+         else if (hf == sm->ssl_accept)
+             s->handshake_func = meth->ssl_accept;
++            
+     }
+     return ret;
+ }
+diff --git a/openssl-1.1.1/ssl/ssl_rsa.c b/openssl-1.1.1/ssl/ssl_rsa.c
+index 172e15f9..4cf0c61f 100644
+--- a/openssl-1.1.1/ssl/ssl_rsa.c
++++ b/openssl-1.1.1/ssl/ssl_rsa.c
+@@ -7,14 +7,19 @@
+  * https://www.openssl.org/source/license.html
+  */
+ 
++#include <execinfo.h>
++#include <stdbool.h>
+ #include <stdio.h>
++#include <sys/select.h>
+ #include "ssl_locl.h"
+ #include "packet_locl.h"
+ #include <openssl/bio.h>
++#include <openssl/bn.h>
+ #include <openssl/objects.h>
+ #include <openssl/evp.h>
+ #include <openssl/x509.h>
+ #include <openssl/pem.h>
++#include <crypto/rpc/rpc.h>
+ 
+ static int ssl_set_cert(CERT *c, X509 *x509);
+ static int ssl_set_pkey(CERT *c, EVP_PKEY *pkey);
+@@ -125,6 +130,106 @@ int SSL_use_RSAPrivateKey(SSL *ssl, RSA *rsa)
+ }
+ #endif
+ 
++//
++// Packs up an RSA object and sends it over the socket to the
++// encryption layer.
++//
++// This function should only be called if we are in PRIV_SEP_MODE_PROCESS
++#ifdef PRIV_SEP_FUNC_ENABLED
++#if PRIV_SEP_MODE == PRIV_SEP_MODE_PROCESS
++void pack_and_send_rsa_st(RSA *rsa)
++{    
++    PackedRSA *packed = calloc(1, sizeof(PackedRSA));
++    packed->total_size = sizeof(PackedRSA);
++    unsigned char *n = malloc(BN_num_bytes(RSA_get0_n(rsa)));
++    unsigned char *e= malloc(BN_num_bytes(RSA_get0_e(rsa)));
++    unsigned char *d = malloc(BN_num_bytes(RSA_get0_d(rsa)));
++    unsigned char *p = malloc(BN_num_bytes(RSA_get0_p(rsa)));
++    unsigned char *q = malloc(BN_num_bytes(RSA_get0_q(rsa)));
++    unsigned char *dmp1 = malloc(BN_num_bytes(RSA_get0_dmp1(rsa)));
++    unsigned char *dmq1 = malloc(BN_num_bytes(RSA_get0_dmq1(rsa)));
++    unsigned char *iqmp = malloc(BN_num_bytes(RSA_get0_iqmp(rsa)));
++
++    packed->version = RSA_get_version(rsa);
++    packed->meth = RSA_get_method(rsa);
++    packed->engine = RSA_get0_engine(rsa);
++    packed->flags = RSA_flags(rsa);
++
++    packed->n_size = BN_bn2bin(RSA_get0_n(rsa), n);
++    packed->total_size += packed->n_size;
++
++    packed->e_size = BN_bn2bin(RSA_get0_e(rsa), e);
++    packed->total_size += packed->e_size;
++
++    packed->d_size = BN_bn2bin(RSA_get0_d(rsa), d);
++    packed->total_size += packed->d_size;
++
++    packed->p_size = BN_bn2bin(RSA_get0_p(rsa), p);
++    packed->total_size += packed->p_size;
++
++    packed->q_size = BN_bn2bin(RSA_get0_q(rsa), q);
++    packed->total_size += packed->q_size;
++
++    packed->dmp1_size = BN_bn2bin(RSA_get0_dmp1(rsa), dmp1);
++    packed->total_size += packed->dmp1_size;
++
++    packed->dmq1_size = BN_bn2bin(RSA_get0_dmq1(rsa), dmq1);
++    packed->total_size += packed->dmq1_size;
++
++    packed->iqmp_size = BN_bn2bin(RSA_get0_iqmp(rsa), iqmp);
++    packed->total_size += packed->iqmp_size;
++
++    unsigned char *data = calloc(1, packed->total_size);
++
++    memcpy(data, packed, sizeof(PackedRSA));
++    unsigned int offset = sizeof(PackedRSA);
++
++    memcpy(data + offset, n, packed->n_size);
++    offset += packed->n_size;
++
++    memcpy(data + offset, e, packed->e_size);
++    offset += packed->e_size;
++
++    memcpy(data + offset, d, packed->d_size);
++    offset += packed->d_size;
++
++    memcpy(data + offset, p, packed->p_size);
++    offset += packed->p_size;
++
++    memcpy(data + offset, q, packed->q_size);
++    offset += packed->q_size;
++
++    memcpy(data + offset, dmp1, packed->dmp1_size);
++    offset += packed->dmp1_size;
++
++    memcpy(data + offset, dmq1, packed->dmq1_size);
++    offset += packed->dmq1_size;
++
++    memcpy(data + offset, iqmp, packed->iqmp_size);
++    offset += packed->iqmp_size;
++
++    #ifdef PRIV_SEP_DEBUG
++        if (offset == packed->total_size)
++            puts("Sizes of the input match!");
++        else
++            printf("Offset %d does not match input size %d\n", offset, packed->total_size);
++
++        dump_rsa(rsa);
++    
++        puts("About to send Installation RPC");
++    #endif
++
++    send_rpc(
++        PRIV_SEP_RPC_PKEY_INSTALL,
++        data,
++        packed->total_size,
++        priv_sep_config->sockets_work[0]
++    );
++}
++
++#endif
++#endif
++
+ static int ssl_set_pkey(CERT *c, EVP_PKEY *pkey)
+ {
+     size_t i;
+@@ -168,6 +273,47 @@ static int ssl_set_pkey(CERT *c, EVP_PKEY *pkey)
+     EVP_PKEY_up_ref(pkey);
+     c->pkeys[i].privatekey = pkey;
+     c->key = &c->pkeys[i];
++
++    // Just set it up for now.
++    // Will remove the private aspects from the main process after.
++
++    #ifdef PRIV_SEP_FUNC_ENABLED
++        RSA *rsa = EVP_PKEY_get0_RSA(pkey);
++        #if PRIV_SEP_MODE == PRIV_SEP_MODE_PROCESS
++            pack_and_send_rsa_st(rsa);
++        #elif PRIV_SEP_MODE == PRIV_SEP_MODE_MPK
++            priv_sep_rsa = RSA_new_method_mmap(NULL);
++            // Set up the key with mmap so it can be protected with MPK
++            RSA_set0_key(
++                priv_sep_rsa,
++                BN_dup_mmap(RSA_get0_n(rsa)),
++                BN_dup_mmap(RSA_get0_e(rsa)),
++                BN_dup_mmap(RSA_get0_d(rsa))
++            );
++            RSA_set0_factors(
++                priv_sep_rsa,
++                BN_dup(RSA_get0_p(rsa)),
++                BN_dup(RSA_get0_q(rsa))
++            );
++            RSA_set0_crt_params(
++                priv_sep_rsa,
++                BN_dup(RSA_get0_dmp1(rsa)),
++                BN_dup(RSA_get0_dmq1(rsa)),
++                BN_dup(RSA_get0_iqmp(rsa))
++            );
++            RSA_set_method(
++                priv_sep_rsa,
++                RSA_get_method(rsa)
++            );
++
++            priv_sep_config = calloc(1, sizeof(PrivSepConfigData));
++            #ifdef PRIV_SEP_DEBUG
++                puts("Set up a plain priv_sep_config for MPK-based privilege separation");
++            #endif
++        #endif
++    RSA_clear_private(rsa);
++    #endif
++    
+     return 1;
+ }
+ 
